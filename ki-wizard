@@ -8,6 +8,30 @@
 
 set -e
 
+# Convert _positions_JLCREADY.csv to JLC CPL format
+# Removes Val/Package columns, renames remaining columns to JLC-expected names
+convert_cpl_jlc() {
+    local input_file="$1"
+    local output_file="${input_file/_positions_JLCREADY.csv/_CPL_JLC.csv}"
+
+    awk -F',' 'BEGIN { OFS="," }
+    NR == 1 {
+        for (i = 1; i <= NF; i++) {
+            col = $i
+            gsub(/^[ \t"]+|[ \t"]+$/, "", col)
+            idx[col] = i
+        }
+        print "Designator", "Mid X", "Mid Y", "Rotation", "Layer"
+        next
+    }
+    {
+        for (i = 1; i <= NF; i++) gsub(/^"|"$/, "", $i)
+        print $idx["Ref"], $idx["PosX"], $idx["PosY"], $idx["Rot"], $idx["Side"]
+    }' "$input_file" > "$output_file"
+
+    echo "Saved: $output_file"
+}
+
 #echo "Filename: $1"
 
 #Generate Timestamp
@@ -67,6 +91,9 @@ kicad-cli pcb export pos --output $out/${proj_name}_positions.csv \
 
 # create a dummy file to hand edit for JLC
 cp $out/${proj_name}_positions.csv $out/${proj_name}_positions_JLCREADY.csv
+
+# generate JLC CPL file (renamed columns, Val/Package removed)
+convert_cpl_jlc $out/${proj_name}_positions_JLCREADY.csv
 
 # export gerbers into their own subdirectory
 kicad-cli pcb export gerbers --output $out/${proj_name}_gerbers \
