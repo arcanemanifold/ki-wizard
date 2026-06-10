@@ -3,15 +3,18 @@
 ki-wizard.py — generates fab deliverables from a KiCad project.
 
 Usage:
-    python ki-wizard.py <projectname>
+    python ki-wizard.py [options] <projectname>
 
 The project name should be the base name of the .kicad_sch / .kicad_pcb
 files, without extension. Quote it if it contains spaces.
 
 2026-01-13: added JLC outputs
+2026-06-09: argparse; provenance file; --include-source; BOM header (--title/--rev/--notes)
 """
 
+import argparse
 import csv
+import hashlib
 import shutil
 import subprocess
 import sys
@@ -19,13 +22,15 @@ import zipfile
 from datetime import datetime
 from pathlib import Path
 
+VERSION = "2.1"
+
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
 def run(cmd: list[str]) -> None:
-    """Run a command, printing it first, and raise on non-zero exit."""
+    """Run a command, printing it first, and exit on non-zero return code."""
     print(">>", " ".join(cmd))
     result = subprocess.run(cmd)
     if result.returncode != 0:
@@ -38,6 +43,14 @@ def zip_directory(source_dir: Path, zip_path: Path) -> None:
         for file in source_dir.rglob("*"):
             if file.is_file():
                 zf.write(file, file.relative_to(source_dir.parent))
+
+
+def sha256(path: Path) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(65536), b""):
+            h.update(chunk)
+    return h.hexdigest()
 
 
 def convert_cpl_jlc(input_path: Path) -> None:
@@ -70,21 +83,96 @@ def convert_cpl_jlc(input_path: Path) -> None:
     print(f"Saved: {output_path}")
 
 
+def prepend_bom_header(bom_path: Path, title: str | None, rev: str | None,
+                       notes: str | None, date: str) -> None:
+    """Prepend project metadata rows to a CSV BOM file."""
+    if not any([title, rev, notes]):
+        return
+
+    original = bom_path.read_text(encoding="utf-8")
+    lines = []
+    if title:
+        lines.append(f"Project,{title}\n")
+    if rev:
+        lines.append(f"Revision,{rev}\n")
+    lines.append(f"Date,{date}\n")
+    if notes:
+        lines.append(f"Notes,{notes}\n")
+    lines.append("\n")
+
+    bom_path.write_text("".join(lines) + original, encoding="utf-8")
+    print(f"BOM header written: {bom_path.name}")
+
+
+def write_provenance(out: Path, sch: Path, pcb: Path, timestamp: str) -> None:
+    """Write provenance.txt recording source file identities for this build."""
+    lines = [
+        f"ki-wizard version: {VERSION}",
+        f"timestamp: {timestamp}",
+        "",
+        "source files:",
+        f"  {sch}",
+        f"    sha256: {sha256(sch)}",
+        f"  {pcb}",
+        f"    sha256: {sha256(pcb)}",
+    ]
+    prov = out / "provenance.txt"
+    prov.write_text("\n".join(lines) + "\n")
+    print(f"Saved: {prov}")
+
+
+def bundle_source(out: Path, proj_file: str, proj_name: str) -> None:
+    """Zip minimal source files (.kicad_pcb, .kicad_sch, .kicad_pro, .pretty/) into the output folder."""
+    source_zip = out / f"{proj_name}_source.zip"
+    proj_dir = Path(proj_file).parent if Path(proj_file).parent != Path(".") else Path(".")
+
+    candidates = [
+        Path(f"{proj_file}.kicad_pcb"),
+        Path(f"{proj_file}.kicad_sch"),
+        Path(f"{proj_file}.kicad_pro"),
+    ]
+    # Include any additional .kicad_sch sheets in the same directory
+    candidates += [p for p in proj_dir.glob("*.kicad_sch") if p not in candidates]
+    # Include custom footprint libraries (.pretty directories)
+    pretty_dirs = list(proj_dir.glob("*.pretty"))
+
+    with zipfile.ZipFile(source_zip, "w", zipfile.ZIP_DEFLATED) as zf:
+        for path in candidates:
+            if path.exists():
+                zf.write(path, path.name)
+        for pretty in pretty_dirs:
+            for file in pretty.rglob("*"):
+                if file.is_file():
+                    zf.write(file, file.relative_to(proj_dir))
+
+    print(f"Saved: {source_zip}")
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
 def main() -> None:
-    if len(sys.argv) < 2:
-        sys.exit("Usage: ki-wizard.py <projectname>")
+    parser = argparse.ArgumentParser(
+        description="Generate KiCad fabrication deliverables."
+    )
+    parser.add_argument("projectname",
+                        help="Base filename of the .kicad_sch/.kicad_pcb files (no extension)")
+    parser.add_argument("--title",  metavar="TEXT", help="Project title for BOM header")
+    parser.add_argument("--rev",    metavar="TEXT", help="Revision string for BOM header")
+    parser.add_argument("--notes",  metavar="TEXT", help="Notes line for BOM header")
+    parser.add_argument("--include-source", action="store_true",
+                        help="Zip minimal source files into the output folder")
+    args = parser.parse_args()
 
-    proj_file = sys.argv[1]
+    proj_file = args.projectname
     proj_name = proj_file.replace(" ", "_")
 
-    sch = f"{proj_file}.kicad_sch"
-    pcb = f"{proj_file}.kicad_pcb"
+    sch = Path(f"{proj_file}.kicad_sch")
+    pcb = Path(f"{proj_file}.kicad_pcb")
 
     timestamp = datetime.now().strftime("%Y-%m-%d-%H%M%S")
+    date_str = datetime.now().strftime("%Y-%m-%d")
 
     # Create _mfg output directory if it doesn't exist
     Path("_mfg").mkdir(exist_ok=True)
@@ -98,44 +186,51 @@ def main() -> None:
          "--output",            str(out / "drc.txt"),
          "--schematic-parity",
          "--severity-error", "--severity-warning",
-         pcb])
+         str(pcb)])
 
     run(["kicad-cli", "sch", "erc",
          "--output",        str(out / "erc.txt"),
          "--severity-error", "--severity-warning",
-         sch])
+         str(sch)])
 
     # -- Schematic PDFs ------------------------------------------------------
     run(["kicad-cli", "sch", "export", "pdf",
          "--output", str(out / f"{proj_name}_schematic_bw.pdf"),
          "--theme",  "Black-White",
-         sch])
+         str(sch)])
 
     run(["kicad-cli", "sch", "export", "pdf",
          "--output", str(out / f"{proj_name}_schematic_color.pdf"),
          "--theme",  "wDark",
-         sch])
+         str(sch)])
 
     # -- BOMs ----------------------------------------------------------------
+    bom_cm = out / f"{proj_name}_BOM_CM.csv"
+    bom_eng = out / f"{proj_name}_BOM_ENG.csv"
+
     # CM BOM
     run(["kicad-cli", "sch", "export", "bom",
-         "--output", str(out / f"{proj_name}_BOM_CM.csv"),
+         "--output", str(bom_cm),
          "--fields", "${QUANTITY},Reference,Value,Description,${FOOTPRINT_NAME},MFG,MPN,LCSC,Sub,Note",
          "--labels", "Qty, Refs, Value, Description, Footprint, MFG, MPN, LCSC#, Substitute, Note",
          "--group-by", "Value",
          "--ref-range-delimiter", "",
          "--exclude-dnp",
-         sch])
+         str(sch)])
+
+    prepend_bom_header(bom_cm, args.title, args.rev, args.notes, date_str)
 
     # ENG / Costed BOM
     run(["kicad-cli", "sch", "export", "bom",
-         "--output", str(out / f"{proj_name}_BOM_ENG.csv"),
+         "--output", str(bom_eng),
          "--fields", "${QUANTITY},Reference,Value,Description,${FOOTPRINT_NAME},MFG,MPN,LCSC,Sub,Note,Price",
          "--labels", "Qty, Refs, Value, Description, Footprint, MFG, MPN, LCSC#, Substitute, Note, Price",
          "--group-by", "Value",
          "--ref-range-delimiter", "",
          "--exclude-dnp",
-         sch])
+         str(sch)])
+
+    prepend_bom_header(bom_eng, args.title, args.rev, args.notes, date_str)
 
     # JLC BOM
     run(["kicad-cli", "sch", "export", "bom",
@@ -145,16 +240,16 @@ def main() -> None:
          "--group-by", "Value",
          "--ref-range-delimiter", "",
          "--exclude-dnp",
-         sch])
+         str(sch)])
 
     # -- Netlist -------------------------------------------------------------
     run(["kicad-cli", "pcb", "export", "ipcd356",
          "--output", str(out / f"{proj_name}_netlist.d356"),
-         pcb])
+         str(pcb)])
 
     # -- Pick-and-place / CPL ------------------------------------------------
-    positions_csv    = out / f"{proj_name}_positions.csv"
-    positions_jlc    = out / f"{proj_name}_positions_JLCREADY.csv"
+    positions_csv = out / f"{proj_name}_positions.csv"
+    positions_jlc = out / f"{proj_name}_positions_JLCREADY.csv"
 
     run(["kicad-cli", "pcb", "export", "pos",
          "--output",              str(positions_csv),
@@ -162,9 +257,8 @@ def main() -> None:
          "--units",  "mm",
          "--use-drill-file-origin",
          "--exclude-dnp",
-         pcb])
+         str(pcb)])
 
-    # Copy positions file for manual JLC editing, then auto-convert to CPL
     shutil.copy(positions_csv, positions_jlc)
     convert_cpl_jlc(positions_jlc)
 
@@ -175,11 +269,11 @@ def main() -> None:
          "--output", str(gerber_dir),
          "--layers", "F.Cu,In1.Cu,In2.Cu,B.Cu,F.Silkscreen,B.Silkscreen,"
                      "Edge.Cuts,F.Paste,B.Paste,F.Mask,B.Mask,User.2",
-         pcb])
+         str(pcb)])
 
     run(["kicad-cli", "pcb", "export", "drill",
          "--output", str(gerber_dir),
-         pcb])
+         str(pcb)])
 
     zip_directory(gerber_dir, out / f"{proj_name}_gerbers.zip")
 
@@ -190,30 +284,37 @@ def main() -> None:
          "--ibt", "--sp", "--black-and-white",
          "--drill-shape-opt", "1",
          "--mode-single",
-         pcb])
+         str(pcb)])
 
     run(["kicad-cli", "pcb", "export", "pdf",
          "--output", str(out / f"{proj_name}_assy_front.pdf"),
          "--layers", "F.Fab,Edge.Cuts",
          "--ibt", "--sp", "--black-and-white", "--mode-single",
-         pcb])
+         str(pcb)])
 
     run(["kicad-cli", "pcb", "export", "pdf",
          "--output", str(out / f"{proj_name}_assy_back.pdf"),
          "--layers", "B.Fab,Edge.Cuts",
          "--mirror", "--ibt", "--sp", "--black-and-white", "--mode-single",
-         pcb])
+         str(pcb)])
 
     # -- Renders -------------------------------------------------------------
     run(["kicad-cli", "pcb", "render",
          "--output", str(out / f"{proj_name}_render_top.png"),
          "--side", "top", "--background", "opaque",
-         pcb])
+         str(pcb)])
 
     run(["kicad-cli", "pcb", "render",
          "--output", str(out / f"{proj_name}_render_bottom.png"),
          "--side", "bottom", "--background", "opaque",
-         pcb])
+         str(pcb)])
+
+    # -- Provenance ----------------------------------------------------------
+    write_provenance(out, sch, pcb, timestamp)
+
+    # -- Optional source bundle ----------------------------------------------
+    if args.include_source:
+        bundle_source(out, proj_file, proj_name)
 
     # -- Move output bundle into _mfg ----------------------------------------
     shutil.move(str(out), "_mfg/")
