@@ -9,7 +9,7 @@ The project name should be the base name of the .kicad_sch / .kicad_pcb
 files, without extension. Quote it if it contains spaces.
 
 2026-01-13: added JLC outputs
-2026-06-09: argparse; provenance file; --include-source; BOM header (--title/--rev/--notes)
+2026-06-09: argparse; provenance file; --include-source
 """
 
 import argparse
@@ -83,27 +83,6 @@ def convert_cpl_jlc(input_path: Path) -> None:
     print(f"Saved: {output_path}")
 
 
-def prepend_bom_header(bom_path: Path, title: str | None, rev: str | None,
-                       notes: str | None, date: str) -> None:
-    """Prepend project metadata rows to a CSV BOM file."""
-    if not any([title, rev, notes]):
-        return
-
-    original = bom_path.read_text(encoding="utf-8")
-    lines = []
-    if title:
-        lines.append(f"Project,{title}\n")
-    if rev:
-        lines.append(f"Revision,{rev}\n")
-    lines.append(f"Date,{date}\n")
-    if notes:
-        lines.append(f"Notes,{notes}\n")
-    lines.append("\n")
-
-    bom_path.write_text("".join(lines) + original, encoding="utf-8")
-    print(f"BOM header written: {bom_path.name}")
-
-
 def write_provenance(out: Path, sch: Path, pcb: Path, timestamp: str) -> None:
     """Write provenance.txt recording source file identities for this build."""
     lines = [
@@ -158,9 +137,6 @@ def main() -> None:
     )
     parser.add_argument("projectname",
                         help="Base filename of the .kicad_sch/.kicad_pcb files (no extension)")
-    parser.add_argument("--title",  metavar="TEXT", help="Project title for BOM header")
-    parser.add_argument("--rev",    metavar="TEXT", help="Revision string for BOM header")
-    parser.add_argument("--notes",  metavar="TEXT", help="Notes line for BOM header")
     parser.add_argument("--include-source", action="store_true",
                         help="Zip minimal source files into the output folder")
     args = parser.parse_args()
@@ -172,7 +148,6 @@ def main() -> None:
     pcb = Path(f"{proj_file}.kicad_pcb")
 
     timestamp = datetime.now().strftime("%Y-%m-%d-%H%M%S")
-    date_str = datetime.now().strftime("%Y-%m-%d")
 
     # Create _mfg output directory if it doesn't exist
     Path("_mfg").mkdir(exist_ok=True)
@@ -205,12 +180,9 @@ def main() -> None:
          str(sch)])
 
     # -- BOMs ----------------------------------------------------------------
-    bom_cm = out / f"{proj_name}_BOM_CM.csv"
-    bom_eng = out / f"{proj_name}_BOM_ENG.csv"
-
     # CM BOM
     run(["kicad-cli", "sch", "export", "bom",
-         "--output", str(bom_cm),
+         "--output", str(out / f"{proj_name}_BOM_CM.csv"),
          "--fields", "${QUANTITY},Reference,Value,Description,${FOOTPRINT_NAME},MFG,MPN,LCSC,Sub,Note",
          "--labels", "Qty, Refs, Value, Description, Footprint, MFG, MPN, LCSC#, Substitute, Note",
          "--group-by", "Value",
@@ -218,19 +190,15 @@ def main() -> None:
          "--exclude-dnp",
          str(sch)])
 
-    prepend_bom_header(bom_cm, args.title, args.rev, args.notes, date_str)
-
     # ENG / Costed BOM
     run(["kicad-cli", "sch", "export", "bom",
-         "--output", str(bom_eng),
+         "--output", str(out / f"{proj_name}_BOM_ENG.csv"),
          "--fields", "${QUANTITY},Reference,Value,Description,${FOOTPRINT_NAME},MFG,MPN,LCSC,Sub,Note,Price",
          "--labels", "Qty, Refs, Value, Description, Footprint, MFG, MPN, LCSC#, Substitute, Note, Price",
          "--group-by", "Value",
          "--ref-range-delimiter", "",
          "--exclude-dnp",
          str(sch)])
-
-    prepend_bom_header(bom_eng, args.title, args.rev, args.notes, date_str)
 
     # JLC BOM
     run(["kicad-cli", "sch", "export", "bom",
