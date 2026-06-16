@@ -53,13 +53,11 @@ def sha256(path: Path) -> str:
     return h.hexdigest()
 
 
-def convert_cpl_jlc(input_path: Path) -> None:
+def convert_cpl_jlc(input_path: Path, output_path: Path) -> None:
     """
-    Convert a _positions_JLCREADY.csv to JLC CPL format.
+    Convert a KiCad positions CSV to JLC CPL format.
     Drops Val and Package columns; renames remaining columns to JLC names.
-    Saves alongside the input with _positions_JLCREADY replaced by _CPL_JLC.
     """
-    output_path = Path(str(input_path).replace("_positions_JLCREADY.csv", "_CPL_JLC.csv"))
 
     column_map = {
         "Ref":  "Designator",
@@ -217,7 +215,6 @@ def main() -> None:
 
     # -- Pick-and-place / CPL ------------------------------------------------
     positions_csv = out / f"{proj_name}_positions.csv"
-    positions_jlc = out / f"{proj_name}_positions_JLCREADY.csv"
 
     run(["kicad-cli", "pcb", "export", "pos",
          "--output",              str(positions_csv),
@@ -227,8 +224,7 @@ def main() -> None:
          "--exclude-dnp",
          str(pcb)])
 
-    shutil.copy(positions_csv, positions_jlc)
-    convert_cpl_jlc(positions_jlc)
+    convert_cpl_jlc(positions_csv, out / f"{proj_name}_CPL_JLC.csv")
 
     # -- Gerbers -------------------------------------------------------------
     gerber_dir = out / f"{proj_name}_gerbers"
