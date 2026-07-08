@@ -11,11 +11,13 @@ files, without extension. Quote it if it contains spaces.
 2026-01-13: added JLC outputs
 2026-06-09: argparse; provenance file; --include-source
 2026-07-08: gerbview HTML layer viewer
+2026-07-08: BOM header rows from KiCad project text variables
 """
 
 import argparse
 import csv
 import hashlib
+import json
 import re
 import shutil
 import subprocess
@@ -24,7 +26,7 @@ import zipfile
 from datetime import datetime
 from pathlib import Path
 
-VERSION = "2.2"
+VERSION = "2.3"
 
 
 # ---------------------------------------------------------------------------
@@ -81,6 +83,45 @@ def convert_cpl_jlc(input_path: Path, output_path: Path) -> None:
             writer.writerow({column_map[col]: row[col] for col in keep})
 
     print(f"Saved: {output_path}")
+
+
+def read_text_variables(pro: Path) -> dict[str, str]:
+    """Read the KiCad project's Text Variables (Project > Text Variables) from .kicad_pro.
+
+    Returns an empty dict if the file doesn't exist or has none defined --
+    this feature is opt-in by simply not being used in the project.
+    """
+    if not pro.exists():
+        return {}
+    try:
+        data = json.loads(pro.read_text())
+    except json.JSONDecodeError:
+        return {}
+    return data.get("text_variables", {})
+
+
+def prepend_bom_header(bom_path: Path, variables: dict[str, str], date_str: str) -> None:
+    """Prepend a fixed set of header rows (sourced from KiCad project text
+    variables) above the real BOM header row. No-op if variables is empty,
+    so BOMs in projects that don't define these stay untouched.
+    """
+    if not variables:
+        return
+
+    rows = [
+        ("Company", variables.get("COMPANY", "")),
+        ("Project", variables.get("PROJECT", "")),
+        ("PCB Revision", variables.get("VERSION", "")),
+        ("BOM Revision", variables.get("BOM REV", "")),
+        ("Firmware file", variables.get("FIRMWARE", "")),
+        ("Date generated", date_str),
+    ]
+
+    original = bom_path.read_text(encoding="utf-8")
+    header_lines = [f"{label},{value}\n" for label, value in rows]
+    header_lines.append("\n")
+    bom_path.write_text("".join(header_lines) + original, encoding="utf-8")
+    print(f"BOM header written: {bom_path.name}")
 
 
 def write_provenance(out: Path, sch: Path, pcb: Path, timestamp: str) -> None:
@@ -337,8 +378,11 @@ def main() -> None:
 
     sch = Path(f"{proj_file}.kicad_sch")
     pcb = Path(f"{proj_file}.kicad_pcb")
+    pro = Path(f"{proj_file}.kicad_pro")
 
     timestamp = datetime.now().strftime("%Y-%m-%d-%H%M%S")
+    date_str = datetime.now().strftime("%Y-%m-%d")
+    text_variables = read_text_variables(pro)
 
     # Create _mfg output directory if it doesn't exist
     Path("_mfg").mkdir(exist_ok=True)
@@ -372,24 +416,28 @@ def main() -> None:
 
     # -- BOMs ----------------------------------------------------------------
     # CM BOM
+    bom_cm = out / f"{proj_name}_BOM_CM.csv"
     run(["kicad-cli", "sch", "export", "bom",
-         "--output", str(out / f"{proj_name}_BOM_CM.csv"),
+         "--output", str(bom_cm),
          "--fields", "${QUANTITY},Reference,Value,Description,${FOOTPRINT_NAME},MFG,MPN,LCSC,Sub,Note",
          "--labels", "Qty, Refs, Value, Description, Footprint, MFG, MPN, LCSC#, Substitute, Note",
          "--group-by", "Value",
          "--ref-range-delimiter", "",
          "--exclude-dnp",
          str(sch)])
+    prepend_bom_header(bom_cm, text_variables, date_str)
 
     # ENG / Costed BOM
+    bom_eng = out / f"{proj_name}_BOM_ENG.csv"
     run(["kicad-cli", "sch", "export", "bom",
-         "--output", str(out / f"{proj_name}_BOM_ENG.csv"),
+         "--output", str(bom_eng),
          "--fields", "${QUANTITY},Reference,Value,Description,${FOOTPRINT_NAME},MFG,MPN,LCSC,Sub,Note,Price",
          "--labels", "Qty, Refs, Value, Description, Footprint, MFG, MPN, LCSC#, Substitute, Note, Price",
          "--group-by", "Value",
          "--ref-range-delimiter", "",
          "--exclude-dnp",
          str(sch)])
+    prepend_bom_header(bom_eng, text_variables, date_str)
 
     # JLC BOM
     run(["kicad-cli", "sch", "export", "bom",
