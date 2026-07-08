@@ -166,7 +166,7 @@ GERBVIEW_TEMPLATE = """<!DOCTYPE html>
   #board { flex: 1; position: relative; padding: 20px; box-sizing: border-box; overflow: hidden; }
   #stack { position: relative; width: 100%; height: 100%; transition: transform 0.3s; }
   #stack.flipped { transform: scaleX(-1); }
-  .pcb-layer { position: absolute; top: 0; left: 0; width: 100%; height: 100%; pointer-events: none; }
+  .pcb-layer { position: absolute; top: 0; left: 0; width: 100%; height: 100%; pointer-events: none; display: block; }
   .pcb-layer.hidden { display: none; }
 </style>
 </head>
@@ -180,7 +180,7 @@ GERBVIEW_TEMPLATE = """<!DOCTYPE html>
 </div>
 <div id="board">
   <div id="stack">
-    __OBJECTS__
+    __LAYER_SVGS__
   </div>
 </div>
 <script>
@@ -213,41 +213,20 @@ function toggleFlip(cb) {
 // Crop every layer to the Edge.Cuts bounding box -- KiCad's own
 // "fit to board" canvas can include off-board silkscreen art, so we
 // compute the true board extent ourselves and share it across layers.
-// Each layer is cropped independently on its own load event, since
-// hidden (display:none) layers can finish loading later or out of order.
-function cropToViewBox(obj, vb) {
-  var svg = obj.contentDocument && obj.contentDocument.querySelector('svg');
-  if (!svg) return false;
-  svg.setAttribute('viewBox', vb);
-  svg.setAttribute('width', '100%');
-  svg.setAttribute('height', '100%');
-  return true;
-}
-
-function applyCropToAllLayers(vb) {
-  document.querySelectorAll('.pcb-layer').forEach(function(obj) {
-    if (!cropToViewBox(obj, vb)) {
-      obj.addEventListener('load', function() { cropToViewBox(obj, vb); });
-    }
-  });
-}
-
-function computeViewBoxFromEdge() {
-  var edgeObj = document.getElementById('layer-Edge-Cuts');
-  var edgeSvg = edgeObj.contentDocument.querySelector('svg');
+// Layers are inline <svg> elements in this same document (not loaded
+// via <object>), so this runs synchronously with no load-order or
+// cross-document access concerns -- important since this file is
+// meant to be opened directly from disk (file://), where browsers
+// commonly restrict cross-document access between separate files.
+(function() {
+  var edgeSvg = document.getElementById('layer-Edge-Cuts');
   var bbox = edgeSvg.getBBox();
   var margin = Math.max(bbox.width, bbox.height) * 0.05;
-  return [bbox.x - margin, bbox.y - margin, bbox.width + margin * 2, bbox.height + margin * 2].join(' ');
-}
-
-var edgeObj = document.getElementById('layer-Edge-Cuts');
-if (edgeObj.contentDocument && edgeObj.contentDocument.querySelector('svg')) {
-  applyCropToAllLayers(computeViewBoxFromEdge());
-} else {
-  edgeObj.addEventListener('load', function() {
-    applyCropToAllLayers(computeViewBoxFromEdge());
+  var vb = [bbox.x - margin, bbox.y - margin, bbox.width + margin * 2, bbox.height + margin * 2].join(' ');
+  document.querySelectorAll('.pcb-layer').forEach(function(svg) {
+    svg.setAttribute('viewBox', vb);
   });
-}
+})();
 
 applyZOrder();
 </script>
@@ -267,8 +246,25 @@ def board_layer_names(pcb: Path) -> set[str]:
     return names
 
 
+def strip_svg_wrapper(svg_text: str) -> str:
+    """Return an SVG file's inner content, stripping the XML declaration,
+    DOCTYPE, and outer <svg>...</svg> tags so it can be embedded inline."""
+    svg_text = re.sub(r"<\?xml[^>]*\?>", "", svg_text)
+    svg_text = re.sub(r"<!DOCTYPE[^>]*>", "", svg_text)
+    svg_text = re.sub(r"<svg[^>]*>", "", svg_text, count=1)
+    svg_text = svg_text[:svg_text.rfind("</svg>")]
+    return svg_text.strip()
+
+
 def export_gerbview(out: Path, proj_name: str, pcb: Path) -> None:
-    """Generate <proj>_gerbview.html plus a companion <proj>_gerbview/ folder of per-layer SVGs."""
+    """Generate <proj>_gerbview.html plus a companion <proj>_gerbview/ folder of per-layer SVGs.
+
+    The companion folder holds standalone SVG files for other uses (Inkscape,
+    sending a single layer to someone). The HTML embeds the same content
+    inline rather than referencing those files, since this viewer is meant
+    to be opened directly from disk and browsers commonly restrict
+    cross-document access between separate file:// resources.
+    """
     available = board_layer_names(pcb)
     layers = [l for l in GERBVIEW_LAYERS if l[0] == "Edge.Cuts" or l[0] in available]
 
@@ -293,19 +289,28 @@ def export_gerbview(out: Path, proj_name: str, pcb: Path) -> None:
         for label, color, default_on, _ in layers
     )
 
-    objects = "\n    ".join(
-        f'<object id="layer-{label.replace(".", "-")}" class="pcb-layer{"" if default_on else " hidden"}" '
-        f'style="opacity:{opacity};" '
-        f'type="image/svg+xml" data="{proj_name}_gerbview/{svg_filename(label)}"></object>'
-        for label, color, default_on, opacity in layers
-    )
+    view_box = None
+    layer_svgs = []
+    for label, color, default_on, opacity in layers:
+        svg_text = (gerbview_dir / svg_filename(label)).read_text()
+        if view_box is None:
+            m = re.search(r'viewBox="([^"]+)"', svg_text)
+            view_box = m.group(1) if m else "0 0 100 100"
+        layer_svgs.append(
+            f'<svg id="layer-{label.replace(".", "-")}" class="pcb-layer{"" if default_on else " hidden"}" '
+            f'style="opacity:{opacity};" '
+            f'xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" '
+            f'viewBox="{view_box}" preserveAspectRatio="xMidYMid meet">\n'
+            f'{strip_svg_wrapper(svg_text)}\n</svg>'
+        )
+    layer_svgs_html = "\n    ".join(layer_svgs)
 
     layer_order_js = "[" + ", ".join(f'"{label.replace(".", "-")}"' for label, *_ in layers) + "]"
 
     html = (GERBVIEW_TEMPLATE
             .replace("__PROJ_NAME__", proj_name)
             .replace("__CHECKBOXES__", checkboxes)
-            .replace("__OBJECTS__", objects)
+            .replace("__LAYER_SVGS__", layer_svgs_html)
             .replace("__LAYER_ORDER_JS__", layer_order_js))
 
     html_path = out / f"{proj_name}_gerbview.html"
