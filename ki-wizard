@@ -10,11 +10,13 @@ files, without extension. Quote it if it contains spaces.
 
 2026-01-13: added JLC outputs
 2026-06-09: argparse; provenance file; --include-source
+2026-07-08: gerbview HTML layer viewer
 """
 
 import argparse
 import csv
 import hashlib
+import re
 import shutil
 import subprocess
 import sys
@@ -22,7 +24,7 @@ import zipfile
 from datetime import datetime
 from pathlib import Path
 
-VERSION = "2.1"
+VERSION = "2.2"
 
 
 # ---------------------------------------------------------------------------
@@ -123,6 +125,192 @@ def bundle_source(out: Path, proj_file: str, proj_name: str) -> None:
                     zf.write(file, file.relative_to(proj_dir))
 
     print(f"Saved: {source_zip}")
+
+
+# ---------------------------------------------------------------------------
+# Gerbview: interactive HTML layer viewer
+# ---------------------------------------------------------------------------
+
+# (label, color, default_on, opacity) -- order is the physical stack from
+# front surface to back surface; drives both the SVG export layer list and
+# the viewer's default (unflipped) z-order.
+GERBVIEW_LAYERS = [
+    ("Edge.Cuts",    "D0D2CD", True,  1.0),
+    ("F.Silkscreen", "F2EDA1", True,  1.0),
+    ("F.Cu",         "C83434", True,  1.0),
+    ("F.Paste",      "B4A09A", False, 1.0),
+    ("F.Mask",       "D864FF", True,  1.0),
+    ("In1.Cu",       "E8A33D", False, 0.5),
+    ("In2.Cu",       "3DA5E8", False, 0.5),
+    ("B.Cu",         "3D8CE8", False, 1.0),
+    ("B.Paste",      "8C7A74", False, 1.0),
+    ("B.Silkscreen", "A8A468", False, 1.0),
+]
+
+GERBVIEW_TEMPLATE = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>__PROJ_NAME__ -- Gerber Layer Viewer</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #1a1a1a; color: #ccc; font-family: sans-serif; }
+  body { display: flex; }
+  #sidebar { width: 160px; min-width: 160px; padding: 16px 12px; background: #111; display: flex; flex-direction: column; gap: 6px; }
+  #sidebar h2 { margin: 0 0 12px; font-size: 13px; text-transform: uppercase; letter-spacing: .08em; color: #888; }
+  .layer-label { display: flex; align-items: center; gap: 8px; font-size: 13px; cursor: pointer; }
+  .layer-label::before { content:""; display:inline-block; width:12px; height:12px; border-radius:2px; background:var(--c); flex-shrink:0; }
+  .layer-label input { display:none; }
+  .layer-label.off { opacity: 0.4; }
+  #flip-row { margin-top: 16px; padding-top: 12px; border-top: 1px solid #333; }
+  #flip-row label { display: flex; align-items: center; gap: 8px; font-size: 13px; cursor: pointer; }
+  #board { flex: 1; position: relative; padding: 20px; box-sizing: border-box; overflow: hidden; }
+  #stack { position: relative; width: 100%; height: 100%; transition: transform 0.3s; }
+  #stack.flipped { transform: scaleX(-1); }
+  .pcb-layer { position: absolute; top: 0; left: 0; width: 100%; height: 100%; pointer-events: none; }
+  .pcb-layer.hidden { display: none; }
+</style>
+</head>
+<body>
+<div id="sidebar">
+  <h2>Layers</h2>
+  __CHECKBOXES__
+  <div id="flip-row">
+    <label><input type="checkbox" id="flip-toggle" onchange="toggleFlip(this)"> Flip board view</label>
+  </div>
+</div>
+<div id="board">
+  <div id="stack">
+    __OBJECTS__
+  </div>
+</div>
+<script>
+var LAYER_ORDER = __LAYER_ORDER_JS__;
+var flipped = false;
+
+function toggleLayer(cb) {
+  var id = 'layer-' + cb.dataset.layer.replace(/\\./g, '-');
+  document.getElementById(id).classList.toggle('hidden', !cb.checked);
+  cb.closest('.layer-label').classList.toggle('off', !cb.checked);
+}
+
+function applyZOrder() {
+  // Front-side layers sit on top in the default (front) view; flipping
+  // makes the back-side layers rise to the top instead, as if the
+  // board were turned over to look at its other face.
+  var n = LAYER_ORDER.length;
+  LAYER_ORDER.forEach(function(id, i) {
+    var el = document.getElementById('layer-' + id);
+    if (el) el.style.zIndex = flipped ? i : (n - 1 - i);
+  });
+}
+
+function toggleFlip(cb) {
+  flipped = cb.checked;
+  document.getElementById('stack').classList.toggle('flipped', flipped);
+  applyZOrder();
+}
+
+// Crop every layer to the Edge.Cuts bounding box -- KiCad's own
+// "fit to board" canvas can include off-board silkscreen art, so we
+// compute the true board extent ourselves and share it across layers.
+// Each layer is cropped independently on its own load event, since
+// hidden (display:none) layers can finish loading later or out of order.
+function cropToViewBox(obj, vb) {
+  var svg = obj.contentDocument && obj.contentDocument.querySelector('svg');
+  if (!svg) return false;
+  svg.setAttribute('viewBox', vb);
+  svg.setAttribute('width', '100%');
+  svg.setAttribute('height', '100%');
+  return true;
+}
+
+function applyCropToAllLayers(vb) {
+  document.querySelectorAll('.pcb-layer').forEach(function(obj) {
+    if (!cropToViewBox(obj, vb)) {
+      obj.addEventListener('load', function() { cropToViewBox(obj, vb); });
+    }
+  });
+}
+
+function computeViewBoxFromEdge() {
+  var edgeObj = document.getElementById('layer-Edge-Cuts');
+  var edgeSvg = edgeObj.contentDocument.querySelector('svg');
+  var bbox = edgeSvg.getBBox();
+  var margin = Math.max(bbox.width, bbox.height) * 0.05;
+  return [bbox.x - margin, bbox.y - margin, bbox.width + margin * 2, bbox.height + margin * 2].join(' ');
+}
+
+var edgeObj = document.getElementById('layer-Edge-Cuts');
+if (edgeObj.contentDocument && edgeObj.contentDocument.querySelector('svg')) {
+  applyCropToAllLayers(computeViewBoxFromEdge());
+} else {
+  edgeObj.addEventListener('load', function() {
+    applyCropToAllLayers(computeViewBoxFromEdge());
+  });
+}
+
+applyZOrder();
+</script>
+</body>
+</html>
+"""
+
+
+def board_layer_names(pcb: Path) -> set[str]:
+    """Enabled layer names (canonical + friendly) from the .kicad_pcb layers table."""
+    text = pcb.read_text()
+    names = set()
+    for m in re.finditer(r'\(\d+\s+"([\w.]+)"\s+\w+(?:\s+"([\w.]+)")?\)', text):
+        names.add(m.group(1))
+        if m.group(2):
+            names.add(m.group(2))
+    return names
+
+
+def export_gerbview(out: Path, proj_name: str, pcb: Path) -> None:
+    """Generate <proj>_gerbview.html plus a companion <proj>_gerbview/ folder of per-layer SVGs."""
+    available = board_layer_names(pcb)
+    layers = [l for l in GERBVIEW_LAYERS if l[0] == "Edge.Cuts" or l[0] in available]
+
+    gerbview_dir = out / f"{proj_name}_gerbview"
+    gerbview_dir.mkdir()
+
+    run(["kicad-cli", "pcb", "export", "svg",
+         "--output", str(gerbview_dir) + "/",
+         "--layers", ",".join(label for label, *_ in layers),
+         "--mode-multi",
+         "--exclude-drawing-sheet",
+         "--fit-page-to-board",
+         str(pcb)])
+
+    def svg_filename(label: str) -> str:
+        return f"{pcb.stem}-{label.replace('.', '_')}.svg"
+
+    checkboxes = "\n  ".join(
+        f'<label class="layer-label" style="--c:#{color}">'
+        f'<input type="checkbox" {"checked" if default_on else ""} '
+        f'onchange="toggleLayer(this)" data-layer="{label}"> {label}</label>'
+        for label, color, default_on, _ in layers
+    )
+
+    objects = "\n    ".join(
+        f'<object id="layer-{label.replace(".", "-")}" class="pcb-layer{"" if default_on else " hidden"}" '
+        f'style="opacity:{opacity};" '
+        f'type="image/svg+xml" data="{proj_name}_gerbview/{svg_filename(label)}"></object>'
+        for label, color, default_on, opacity in layers
+    )
+
+    layer_order_js = "[" + ", ".join(f'"{label.replace(".", "-")}"' for label, *_ in layers) + "]"
+
+    html = (GERBVIEW_TEMPLATE
+            .replace("__PROJ_NAME__", proj_name)
+            .replace("__CHECKBOXES__", checkboxes)
+            .replace("__OBJECTS__", objects)
+            .replace("__LAYER_ORDER_JS__", layer_order_js))
+
+    html_path = out / f"{proj_name}_gerbview.html"
+    html_path.write_text(html)
+    print(f"Saved: {html_path}")
 
 
 # ---------------------------------------------------------------------------
@@ -240,6 +428,9 @@ def main() -> None:
          str(pcb)])
 
     zip_directory(gerber_dir, out / f"{proj_name}_gerbers.zip")
+
+    # -- Gerbview layer viewer ------------------------------------------------
+    export_gerbview(out, proj_name, pcb)
 
     # -- Fab drawings --------------------------------------------------------
     run(["kicad-cli", "pcb", "export", "pdf",
