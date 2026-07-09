@@ -28,6 +28,7 @@ Written to `_mfg/<projectname>_fab-outputs_<timestamp>/`:
 - `*_netlist.d356`
 - `*_positions.csv`, `*_CPL_JLC.csv`
 - `*_gerbers/`, `*_gerbers.zip`
+- `*_gerbview.html`, `*_gerbview/` — interactive HTML gerber layer viewer + companion per-layer SVGs
 - `*_drilldwg.pdf`, `*_assy_front.pdf`, `*_assy_back.pdf`
 - `*_render_top.png`, `*_render_bottom.png`
 - `provenance.txt` — ki-wizard version, timestamp, sha256 of source files
@@ -35,3 +36,11 @@ Written to `_mfg/<projectname>_fab-outputs_<timestamp>/`:
 ## Options
 
 - `--include-source` — zip `.kicad_pcb`, `.kicad_sch`, `.kicad_pro`, and `.pretty/` libraries into the output folder
+
+## BOM header
+
+CM and ENG BOMs get a 6-row header (Company, Project, PCB Revision, BOM Revision, Firmware file, Date generated) sourced from the KiCad project's Text Variables (`.kicad_pro`'s `text_variables`). Expected variable names: `COMPANY`, `PROJECT`, `VERSION`, `BOM REV`, `FIRMWARE`. No-op if the project hasn't defined them. JLC BOM is never touched.
+
+## Gerbview
+
+Self-contained HTML layer viewer, opens directly from disk (no server). Layer checkboxes + a flip-board-view toggle. Layer content is inlined into the HTML (not referenced via `<object>`) since browsers restrict cross-document access between separate `file://` resources.
